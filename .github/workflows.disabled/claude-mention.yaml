@@ -1,0 +1,102 @@
+name: claude-mention
+# Runner versions pinned; see ci.yaml header comment for rationale.
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+# Consistent with ci.yaml for cache compatibility
+env:
+  CARGO_TERM_COLOR: always
+  CLICOLOR_FORCE: 1
+  RUSTFLAGS: "-C debuginfo=0"
+  RUSTDOCFLAGS: "-Dwarnings"
+
+jobs:
+  claude:
+    # Only run when body/comment contains @claude.
+    # Note: secrets cannot be used in job-level `if:` (actions/runner#520) —
+    # doing so causes GitHub to fail the workflow on push validation. For review
+    # comments on fork PRs (which don't receive secrets), we detect forks via
+    # github.event context instead. Use a Conversation tab comment for fork PRs.
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Allow pushing commits
+      pull-requests: write # Allow commenting and updating PRs
+      issues: write # Allow commenting on issues
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
+    steps:
+      - name: 📂 Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          # Use bot token so pushed commits trigger CI workflows
+          token: ${{ secrets.WORKTRUNK_BOT_TOKEN }}
+
+      - name: 🔧 Configure git for Claude
+        run: |
+          git config --global user.name "Claude Code"
+          git config --global user.email "claude@anthropic.com"
+
+      - name: 📌 Check out PR branch
+        if: github.event.issue.pull_request
+        run: gh pr checkout ${{ github.event.issue.number }}
+        env:
+          GH_TOKEN: ${{ secrets.WORKTRUNK_BOT_TOKEN }}
+
+      - name: Install cargo-insta
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-insta
+
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+
+      - name: 💰 Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ hashFiles('Cargo.lock') }}
+          save-if: false
+
+      - name: Install shells (zsh, fish)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh fish
+
+      - name: 🤖 Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use bot token so pushed commits trigger CI workflows
+          github_token: ${{ secrets.WORKTRUNK_BOT_TOKEN }}
+
+          # This is an optional setting that allows Claude to read CI results on PRs
+          additional_permissions: |
+            actions: read
+
+          claude_args: |
+            --model opus
+            --allowedTools Bash,Edit,Read,Write,Glob,Grep,WebSearch,WebFetch,Task,Skill
+            --append-system-prompt "You are operating in a GitHub Actions CI environment. Use /running-in-ci before starting work."
+
+      - name: 📋 Upload Claude Code session logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: claude-session-logs
+          path: ${{ env.HOME }}/.claude/
+          retention-days: 30
+          if-no-files-found: warn
