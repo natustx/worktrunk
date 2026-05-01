@@ -24,7 +24,19 @@ Unlike `git merge`, this merges the current branch into the target branch — no
 
 Merge to the default branch:
 
-{{ terminal(cmd="wt merge") }}
+{% terminal(cmd="wt merge") %}
+<span class=c>◎</span> <span class=c>Running pre-merge <b>project:test</b></span>
+<span style='background:var(--bright-white,#fff)'> </span> <span class=d><span style='color:var(--blue,#00a)'>cargo</span></span><span class=d> nextest run</span>
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Summary [   0.002s] 2 tests run: 2 passed, 0 skipped
+<span class=c>◎</span> <span class=c>Merging 1 commit to <b>main</b> @ <span class=d>a1b2c3d</span> (no commit/squash/rebase needed)</span>
+<span style='background:var(--bright-white,#fff)'> </span> * <span style='color:var(--yellow,#a60)'>a1b2c3d</span> feat: add hook registration
+<span style='background:var(--bright-white,#fff)'> </span>  hook.rs | 31 <span class=g>+++++++++++++++++++++++++++++++</span>
+<span style='background:var(--bright-white,#fff)'> </span>  1 file changed, 31 insertions(+)
+<span class=g>✓</span> <span class=g>Merged to <b>main</b> <span style='color:var(--bright-black,#555)'>(1 commit, 1 file, +31</span></span><span style='color:var(--bright-black,#555)'>)</span>
+<span class=c>◎</span> <span class=c>Removing <b>hooks</b> worktree &amp; branch in background (same commit as <b>main</b>,</span> <span class=d>_</span><span class=c>)</span>
+<span class=d>○</span> Switched to worktree for <b>main</b> @ <b>~/repo</b>
+{% end %}
 
 Merge to a different branch:
 
@@ -70,7 +82,7 @@ Historically, ensuring tests ran before merging was difficult to enforce locally
 The full workflow: start an agent (one of many) on a task, work elsewhere, return when it's ready. Review the diff, run `wt merge`, move on. Pre-merge hooks validate before merging — if they pass, the branch goes to the default branch and the worktree cleans up.
 
 ```toml
-[pre-merge]
+[[pre-merge]]
 test = "cargo test"
 lint = "cargo clippy"
 ```
@@ -124,11 +136,19 @@ Usage: <b><span class=c>wt merge</span></b> <span class=c>[OPTIONS]</span> <span
           Print help (see a summary with &#39;-h&#39;)
 
 <b><span class=g>Automation:</span></b>
-  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
-          Skip approval prompts
-
-      <b><span class=c>--no-verify</span></b>
+      <b><span class=c>--no-hooks</span></b>
           Skip hooks
+
+      <b><span class=c>--format</span></b><span class=c> &lt;FORMAT&gt;</span>
+          Output format
+
+          JSON prints structured result to stdout after merge completes.
+
+          Possible values:
+          - <b><span class=c>text</span></b>: Human-readable text output
+          - <b><span class=c>json</span></b>: JSON output
+
+          [default: text]
 
 <b><span class=g>Global Options:</span></b>
   <b><span class=c>-C</span></b><span class=c> &lt;path&gt;</span>
@@ -138,7 +158,11 @@ Usage: <b><span class=c>wt merge</span></b> <span class=c>[OPTIONS]</span> <span
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
-<!-- END AUTO-GENERATED from `wt merge --help-page` -->
+<!-- END AUTO-GENERATED -->

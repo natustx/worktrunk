@@ -53,6 +53,16 @@ fn approval_pty_settings(repo: &TestRepo) -> insta::Settings {
     settings
 }
 
+/// Decline-path regression: a declined approval prompt prints its own "Commands declined,
+/// …" line; the downstream commit/squash phase must not also print
+/// "Skipping pre-commit hooks (--no-hooks)" — the user didn't pass that flag.
+fn assert_no_spurious_no_hooks(output: &str) {
+    assert!(
+        !output.contains("--no-hooks"),
+        "Declined approval should not produce a spurious '(--no-hooks)' line. Output:\n{output}"
+    );
+}
+
 /// Get test env vars with shell integration configured.
 ///
 /// This adds SHELL=/bin/zsh to the env vars, which is needed because:
@@ -119,10 +129,11 @@ fn test_approval_prompt_multiple_commands(repo: TestRepo) {
     repo.run_git(&["remote", "remove", "origin"]);
 
     repo.write_project_config(
-        r#"[pre-start]
-first = "echo 'First command'"
-second = "echo 'Second command'"
-third = "echo 'Third command'"
+        r#"pre-start = [
+    {first = "echo 'First command'"},
+    {second = "echo 'Second command'"},
+    {third = "echo 'Third command'"},
+]
 "#,
     );
     repo.commit("Add config");
@@ -224,10 +235,11 @@ fn test_approval_prompt_named_commands(repo: TestRepo) {
     repo.run_git(&["remote", "remove", "origin"]);
 
     repo.write_project_config(
-        r#"[pre-start]
-install = "echo 'Installing dependencies...'"
-build = "echo 'Building project...'"
-test = "echo 'Running tests...'"
+        r#"pre-start = [
+    {install = "echo 'Installing dependencies...'"},
+    {build = "echo 'Building project...'"},
+    {test = "echo 'Running tests...'"},
+]
 "#,
     );
     repo.commit("Add config");
@@ -266,10 +278,11 @@ fn test_approval_prompt_mixed_approved_unapproved_accept(repo: TestRepo) {
     repo.run_git(&["remote", "remove", "origin"]);
 
     repo.write_project_config(
-        r#"[pre-start]
-first = "echo 'First command'"
-second = "echo 'Second command'"
-third = "echo 'Third command'"
+        r#"pre-start = [
+    {first = "echo 'First command'"},
+    {second = "echo 'Second command'"},
+    {third = "echo 'Third command'"},
+]
 "#,
     );
     repo.commit("Add config");
@@ -322,10 +335,11 @@ fn test_approval_prompt_mixed_approved_unapproved_decline(repo: TestRepo) {
     repo.run_git(&["remote", "remove", "origin"]);
 
     repo.write_project_config(
-        r#"[pre-start]
-first = "echo 'First command'"
-second = "echo 'Second command'"
-third = "echo 'Third command'"
+        r#"pre-start = [
+    {first = "echo 'First command'"},
+    {second = "echo 'Second command'"},
+    {third = "echo 'Third command'"},
+]
 "#,
     );
     repo.commit("Add config");
@@ -455,6 +469,7 @@ command = "cat >/dev/null && echo 'feat: test commit message'"
         output.contains("committing without hooks"),
         "Should indicate commit proceeds without hooks. Output:\n{output}"
     );
+    assert_no_spurious_no_hooks(&output);
 }
 
 #[rstest]
@@ -496,5 +511,87 @@ command = "cat >/dev/null && echo 'feat: squashed commit message'"
     assert!(
         output.contains("squashing without hooks"),
         "Should indicate squash proceeds without hooks. Output:\n{output}"
+    );
+    assert_no_spurious_no_hooks(&output);
+}
+
+/// `wt merge` with a pre-commit hook + dirty worktree: declining the approval
+/// prompt should print only "Commands declined, continuing merge", not also
+/// "Skipping pre-commit hooks (--no-hooks)" from the commit phase.
+#[rstest]
+fn test_approval_prompt_merge_decline_no_spurious_skip(mut repo: TestRepo) {
+    // Remove origin so worktrunk uses directory name as project identifier
+    repo.run_git(&["remote", "remove", "origin"]);
+
+    // Add pre-commit hook to project config and commit it
+    repo.write_project_config(r#"pre-commit = "echo 'pre-commit hook'""#);
+    repo.commit("Add pre-commit config");
+
+    // Create a feature worktree with a dirty change so the merge runs the commit phase
+    let feature_wt = repo.add_worktree("feature-merge-decline");
+    std::fs::write(feature_wt.join("new-file.txt"), "new content").unwrap();
+
+    // Configure LLM commit generation so the commit phase has a message to use
+    repo.write_test_config(
+        r#"
+[commit.generation]
+command = "cat >/dev/null && echo 'feat: test commit message'"
+"#,
+    );
+
+    let env_vars = test_env_vars_with_shell(&repo);
+
+    // Decline the approval prompt
+    let (output, exit_code) = exec_wt_in_pty_cwd(&feature_wt, &["merge"], &env_vars, "n\n");
+
+    assert_eq!(
+        exit_code, 0,
+        "Merge should succeed even when hooks declined. Output:\n{output}"
+    );
+    assert!(
+        output.contains("Commands declined, continuing merge"),
+        "Should show merge-specific decline message. Output:\n{output}"
+    );
+    assert_no_spurious_no_hooks(&output);
+}
+
+/// `wt config approvals add` accepts the prompt — covers the success branch of
+/// `add_approvals` after `approve_command_batch` returns Ok(true).
+#[rstest]
+fn test_config_approvals_add_accept(repo: TestRepo) {
+    repo.run_git(&["remote", "remove", "origin"]);
+    repo.write_project_config(r#"pre-start = "echo 'test command'""#);
+    repo.commit("Add config");
+
+    let env_vars = repo.test_env_vars();
+    let (output, exit_code) =
+        exec_wt_in_pty(&repo, &["config", "approvals", "add"], &env_vars, "y\n");
+
+    assert_eq!(exit_code, 0, "add should exit cleanly. Output:\n{output}");
+    assert!(
+        output.contains("Commands approved"),
+        "Should show approval success. Output:\n{output}"
+    );
+}
+
+/// `wt config approvals add` declines the prompt — covers the declined branch
+/// of `add_approvals` after `approve_command_batch` returns Ok(false).
+#[rstest]
+fn test_config_approvals_add_decline(repo: TestRepo) {
+    repo.run_git(&["remote", "remove", "origin"]);
+    repo.write_project_config(r#"pre-start = "echo 'test command'""#);
+    repo.commit("Add config");
+
+    let env_vars = repo.test_env_vars();
+    let (output, exit_code) =
+        exec_wt_in_pty(&repo, &["config", "approvals", "add"], &env_vars, "n\n");
+
+    assert_eq!(
+        exit_code, 0,
+        "decline should exit cleanly. Output:\n{output}"
+    );
+    assert!(
+        output.contains("Commands declined"),
+        "Should show decline message. Output:\n{output}"
     );
 }

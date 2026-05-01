@@ -8,8 +8,19 @@ Unlike `git merge`, this merges the current branch into the target branch — no
 
 Merge to the default branch:
 
-```bash
+```
 $ wt merge
+◎ Running pre-merge project:test
+  cargo nextest run
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Summary [   0.002s] 2 tests run: 2 passed, 0 skipped
+◎ Merging 1 commit to main @ a1b2c3d (no commit/squash/rebase needed)
+  * a1b2c3d feat: add hook registration
+   hook.rs | 31 +++++++++++++++++++++++++++++++
+   1 file changed, 31 insertions(+)
+✓ Merged to main (1 commit, 1 file, +31)
+◎ Removing hooks worktree & branch in background (same commit as main, _)
+○ Switched to worktree for main @ ~/repo
 ```
 
 Merge to a different branch:
@@ -66,7 +77,7 @@ Historically, ensuring tests ran before merging was difficult to enforce locally
 The full workflow: start an agent (one of many) on a task, work elsewhere, return when it's ready. Review the diff, run `wt merge`, move on. Pre-merge hooks validate before merging — if they pass, the branch goes to the default branch and the worktree cleans up.
 
 ```toml
-[pre-merge]
+[[pre-merge]]
 test = "cargo test"
 lint = "cargo clippy"
 ```
@@ -114,11 +125,19 @@ Options:
           Print help (see a summary with '-h')
 
 Automation:
-  -y, --yes
-          Skip approval prompts
-
-      --no-verify
+      --no-hooks
           Skip hooks
+
+      --format <FORMAT>
+          Output format
+
+          JSON prints structured result to stdout after merge completes.
+
+          Possible values:
+          - text: Human-readable text output
+          - json: JSON output
+
+          [default: text]
 
 Global Options:
   -C <path>
@@ -128,5 +147,9 @@ Global Options:
           User config file path
 
   -v, --verbose...
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable & output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  -y, --yes
+          Skip approval prompts
 ```

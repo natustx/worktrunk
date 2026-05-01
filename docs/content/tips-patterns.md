@@ -9,24 +9,37 @@ group = "Reference"
 
 Practical recipes for common Worktrunk workflows.
 
-## Alias for new worktree + agent
+## Shell alias for new worktree + agent
 
 Create a worktree and launch Claude in one command:
 
 {{ terminal(cmd="alias wsc='wt switch --create --execute=claude'|||wsc new-feature                       # Creates worktree, runs hooks, launches Claude|||wsc feature -- 'Fix GH #322'          # Runs `claude 'Fix GH #322'`") }}
 
-## Eliminate cold starts
+## `wt` aliases
 
-Use [`wt step copy-ignored`](@/step.md#wt-step-copy-ignored) to copy gitignored files (caches, dependencies, `.env`) between worktrees:
+Compose with template filters and [vars](@/tips-patterns.md#per-branch-variables) for branch-specific shortcuts:
 
 ```toml
-[post-start]
-copy = "wt step copy-ignored"
+# .config/wt.toml
+[aliases]
+# Open this worktree's dev server
+open = "open http://localhost:{{ branch | hash_port }}"
+
+# Test with branch-specific features from vars
+test = "cargo test --features {{ vars.features | default('default') }}"
 ```
 
-Use `pre-start` instead if subsequent hooks or `--execute` command need the copied files immediately.
+See [Aliases](@/extending.md#aliases) for scoping, approval, and reference.
 
-All gitignored files are copied by default. To limit what gets copied, create `.worktreeinclude` with patterns — files must be both gitignored and listed. See [`wt step copy-ignored`](@/step.md#wt-step-copy-ignored) for details.
+## Per-branch variables
+
+`wt config state vars` holds state per branch, accessible from templates (`{{ vars.key }}`) and the CLI. Some uses:
+
+- **Coordinate state across pipeline steps** — see [Database per worktree](@/tips-patterns.md#database-per-worktree) below for a full recipe
+- **Stick a branch to an environment** — `wt config state vars set env=staging`, then `{{ vars.env | default('dev') }}` in hooks
+- **Parametrize aliases per branch** — see [`wt` aliases above](@/tips-patterns.md#wt-aliases)
+
+See [`wt config state vars`](@/config.md#wt-config-state-vars) for storage format, JSON support, and reference.
 
 ## Dev server per worktree
 
@@ -46,7 +59,7 @@ server = "lsof -ti :{{ branch | hash_port }} -sTCP:LISTEN | xargs kill 2>/dev/nu
 
 The URL column in `wt list` shows each worktree's dev server:
 
-<!-- ⚠️ AUTO-GENERATED-HTML from tests/snapshots/integration__integration_tests__list__tips_dev_server_workflow.snap — edit source to update -->
+<!-- ⚠️ AUTO-GENERATED from tests/snapshots/integration__integration_tests__list__tips_dev_server_workflow.snap — edit source to update -->
 
 {% terminal(cmd="wt list") %}
 <span class="cmd">wt list</span>
@@ -65,25 +78,26 @@ Ports are deterministic — `fix-auth` always gets port 16460, regardless of whi
 
 ## Database per worktree
 
-Each worktree can have its own isolated database. A pipeline sets up names and ports as vars, then later steps and hooks reference them:
+Each worktree can have its own isolated database. A pipeline sets up names and ports as [vars](@/config.md#wt-config-state-vars), then later steps and hooks reference them:
 
 ```toml
-post-start = [
-  """
-  wt config state vars set \
-    container='{{ repo }}-{{ branch | sanitize }}-postgres' \
-    port='{{ ('db-' ~ branch) | hash_port }}' \
-    db_url='postgres://postgres:dev@localhost:{{ ('db-' ~ branch) | hash_port }}/{{ branch | sanitize_db }}'
-  """,
-  { db = """
-  docker run -d --rm \
-    --name {{ vars.container }} \
-    -p {{ vars.port }}:5432 \
-    -e POSTGRES_DB={{ branch | sanitize_db }} \
-    -e POSTGRES_PASSWORD=dev \
-    postgres:16
-  """},
-]
+[[post-start]]
+set-vars = """
+wt config state vars set \
+  container='{{ repo }}-{{ branch | sanitize }}-postgres' \
+  port='{{ ('db-' ~ branch) | hash_port }}' \
+  db_url='postgres://postgres:dev@localhost:{{ ('db-' ~ branch) | hash_port }}/{{ branch | sanitize_db }}'
+"""
+
+[[post-start]]
+db = """
+docker run -d --rm \
+  --name {{ vars.container }} \
+  -p {{ vars.port }}:5432 \
+  -e POSTGRES_DB={{ branch | sanitize_db }} \
+  -e POSTGRES_PASSWORD=dev \
+  postgres:16
+"""
 
 [pre-remove]
 db-stop = "docker stop {{ vars.container }} 2>/dev/null || true"
@@ -97,17 +111,28 @@ The connection string is accessible anywhere — not just in hooks:
 
 {{ terminal(cmd="DATABASE_URL=$(wt config state vars get db_url) npm start") }}
 
-## Local CI gate
+## Eliminate cold starts
 
-`pre-merge` hooks run before merging. Failures abort the merge:
+Use [`wt step copy-ignored`](@/step.md#wt-step-copy-ignored) to copy gitignored files (caches, dependencies, `.env`) between worktrees:
 
 ```toml
-[pre-merge]
-"lint" = "uv run ruff check"
-"test" = "uv run pytest"
+[post-start]
+copy = "wt step copy-ignored"
 ```
 
-This catches issues locally before pushing — like running CI locally.
+When another hook depends on the copy — for example, copying `node_modules/` before `pnpm install` so the install reuses cached packages — sequence them with a `[[post-start]]` pipeline:
+
+```toml
+[[post-start]]
+copy = "wt step copy-ignored"
+
+[[post-start]]
+install = "pnpm install"
+```
+
+Use `pre-start` instead when an `--execute` command needs the copied files immediately.
+
+All gitignored files are copied by default. To limit what gets copied, create `.worktreeinclude` with patterns — files must be both gitignored and listed. See [`wt step copy-ignored`](@/step.md#wt-step-copy-ignored) for details.
 
 ## Manual commit messages
 
@@ -121,7 +146,7 @@ command = '''f=$(mktemp); printf '\n\n' > "$f"; sed 's/^/# /' >> "$f"; ${EDITOR:
 
 This comments out the rendered prompt (diff, branch name, stats) with `#` prefixes, opens your editor, and strips comment lines on save. A couple of blank lines at the top give you space to type; the prompt context is visible below for reference.
 
-To keep the LLM as default but use the editor for a specific merge, add a [worktrunk alias](@/step.md#aliases):
+To keep the LLM as default but use the editor for a specific merge, add a [worktrunk alias](@/extending.md#aliases):
 
 ```toml
 # ~/.config/worktrunk/config.toml
@@ -129,23 +154,23 @@ To keep the LLM as default but use the editor for a specific merge, add a [workt
 mc = '''WORKTRUNK_COMMIT__GENERATION__COMMAND='f=$(mktemp); printf "\n\n" > "$f"; sed "s/^/# /" >> "$f"; ${EDITOR:-vi} "$f" < /dev/tty > /dev/tty; grep -v "^#" "$f"' wt merge'''
 ```
 
-Then `wt step mc` opens an editor for the commit message while plain `wt merge` continues to use the LLM.
+Then `wt mc` opens an editor for the commit message while plain `wt merge` continues to use the LLM.
 
 ## Track agent status
 
-Custom emoji markers show agent state in `wt list`. The Claude Code plugin sets these automatically:
+Custom emoji markers show agent state in `wt list`. The [Claude Code](@/claude-code.md) plugin and [OpenCode plugin](https://github.com/max-sixty/worktrunk/tree/main/dev/opencode-plugin.ts) set these automatically:
 
 ```
 + feature-api      ↑  🤖              ↑1      ./repo.feature-api
 + review-ui      ? ↑  💬              ↑1      ./repo.review-ui
 ```
 
-- `🤖` — Claude is working
-- `💬` — Claude is waiting for input
+- `🤖` — Agent is working
+- `💬` — Agent is waiting for input
 
 Set status manually for any workflow:
 
-{{ terminal(cmd="wt config state marker set &quot;🚧&quot;                   # Current branch|||wt config state marker set &quot;✅&quot; --branch feature  # Specific branch|||git config worktrunk.state.feature.marker '{&quot;marker&quot;:&quot;💬&quot;,&quot;set_at&quot;:0}'  # Direct") }}
+{{ terminal(cmd="wt config state marker set __WT_QUOT__🚧__WT_QUOT__                   # Current branch|||wt config state marker set __WT_QUOT__✅__WT_QUOT__ --branch feature  # Specific branch|||git config worktrunk.state.feature.marker '{__WT_QUOT__marker__WT_QUOT__:__WT_QUOT__💬__WT_QUOT__,__WT_QUOT__set_at__WT_QUOT__:0}'  # Direct") }}
 
 See [Claude Code Integration](@/claude-code.md#installation) for plugin installation.
 
@@ -165,7 +190,7 @@ With `summary = true` and [`commit.generation`](@/config.md#commit) configured, 
 summary = true
 ```
 
-Summaries are cached and regenerated only when the diff changes. See [LLM Commits](@/llm-commits.md#branch-summaries) for details.
+See [LLM Commits](@/llm-commits.md#branch-summaries) for details.
 
 ## JSON API
 
@@ -191,6 +216,38 @@ Reference Taskfile/Justfile/Makefile in hooks:
 "validate" = "just test lint"
 ```
 
+## Progressive validation
+
+Split checks across hook types — quick feedback before each commit, expensive suites before merge:
+
+```toml
+[[pre-commit]]
+lint = "npm run lint"
+typecheck = "npm run typecheck"
+
+[[pre-merge]]
+test = "npm test"
+build = "npm run build"
+```
+
+`pre-commit` runs on every squash commit during `wt merge`; `pre-merge` runs once per merge after the rebase, so it's the right place for the slow tests.
+
+## Target-specific hooks
+
+Branch on `{{ target }}` to vary behavior per merge destination — for example, deploying to production from `main` and staging from a release branch:
+
+```toml
+post-merge = """
+if [ {{ target }} = main ]; then
+    npm run deploy:production
+elif [ {{ target }} = staging ]; then
+    npm run deploy:staging
+fi
+"""
+```
+
+`{{ target }}` is the branch being merged into. `post-merge` runs in the target's worktree (or the primary worktree if target has none), so deploy commands see the merged code.
+
 ## Shortcuts
 
 Special arguments work across all commands—see [`wt switch`](@/switch.md#shortcuts) for the full list.
@@ -203,21 +260,19 @@ Branch from current HEAD instead of the default branch:
 
 {{ terminal(cmd="wt switch --create feature-part2 --base=@") }}
 
-Creates a worktree that builds on the current branch's changes.
-
 ## Agent handoffs
 
-Spawn a worktree with Claude running in the background:
+Spawn a worktree with an agent CLI running in the background. Examples below use `claude`; for OpenCode, replace `claude` with `'opencode run'`.
 
 **tmux** (new detached session):
-{{ terminal(cmd="tmux new-session -d -s fix-auth-bug &quot;wt switch --create fix-auth-bug -x claude -- \|||  'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'&quot;") }}
+{{ terminal(cmd="tmux new-session -d -s fix-auth-bug __WT_QUOT__wt switch --create fix-auth-bug -x claude -- \|||  'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'__WT_QUOT__") }}
 
 **Zellij** (new pane in current session):
 {{ terminal(cmd="zellij run -- wt switch --create fix-auth-bug -x claude -- \|||  'The login session expires after 5 minutes. Find the session timeout config and extend it to 24 hours.'") }}
 
-This lets one Claude session hand off work to another that runs in the background. Hooks run inside the multiplexer session/pane.
+This lets one agent session hand off work to another that runs in the background. Hooks run inside the multiplexer session/pane.
 
-The [worktrunk skill](@/claude-code.md) includes guidance for Claude Code to execute this pattern. To enable it, request it explicitly ("spawn a parallel worktree for...") or add to `CLAUDE.md`:
+The [worktrunk skill](@/claude-code.md) includes guidance for Claude Code (and other agent CLIs that load it) to execute this pattern. To enable it, request it explicitly ("spawn a parallel worktree for...") or add to your project instructions (`CLAUDE.md` or `AGENTS.md`):
 
 ```markdown
 When I ask you to spawn parallel worktrees, use the agent handoff pattern
@@ -226,7 +281,7 @@ from the worktrunk skill.
 
 ## Tmux session per worktree
 
-Each worktree gets its own tmux session with a multi-pane layout. Sessions are named after the branch for easy identification.
+Each worktree gets its own tmux session with a multi-pane layout.
 
 ```toml
 # .config/wt.toml
@@ -253,8 +308,6 @@ echo "✓ Session '$S' — attach with: tmux attach -t $S"
 [pre-remove]
 tmux = "tmux kill-session -t {{ branch | sanitize }} 2>/dev/null || true"
 ```
-
-`pre-remove` stops all services when the worktree is removed.
 
 To create a worktree and immediately attach:
 
@@ -321,13 +374,13 @@ url = "http://{{ branch | sanitize }}.{{ repo }}.localhost:8080"
 
 Follow background hook output in real-time:
 
-{{ terminal(cmd="tail -f &quot;$(wt config state logs get --hook=user:post-start:server)&quot;") }}
+{{ terminal(cmd="tail -f __WT_QUOT__$(wt config state logs get --hook=user:post-start:server)__WT_QUOT__") }}
 
 The `--hook` format is `source:hook-type:name` — e.g., `project:post-start:build` for project-defined hooks. Use `wt config state logs get` to list all available logs.
 
 Create an alias for frequent use:
 
-{{ terminal(cmd="alias wtlog='f() { tail -f &quot;$(wt config state logs get --hook=&quot;$1&quot;)&quot;; }; f'") }}
+{{ terminal(cmd="alias wtlog='f() { tail -f __WT_QUOT__$(wt config state logs get --hook=__WT_QUOT__$1__WT_QUOT__)__WT_QUOT__; }; f'") }}
 
 ## Bare repository layout
 

@@ -66,47 +66,38 @@ impl<'a> Branch<'a> {
     ///
     /// Returns a list of remote names that have this branch (e.g., `["origin"]`).
     /// Returns an empty list if no remotes have this branch.
+    ///
+    /// Filters the repository's remote-branch inventory (see
+    /// [`Repository::remote_branches`]); the first call within a command
+    /// triggers the `refs/remotes/` scan that populates the inventory.
+    ///
+    /// [`Repository::remote_branches`]: super::Repository::remote_branches
     pub fn remotes(&self) -> anyhow::Result<Vec<String>> {
-        // Get all remote tracking branches matching this name
-        // Format: refs/remotes/<remote>/<branch>
-        let output = self.repo.run_command(&[
-            "for-each-ref",
-            "--format=%(refname:strip=2)",
-            &format!("refs/remotes/*/{}", self.name),
-        ])?;
-
-        // Parse output: each line is "<remote>/<branch>"
-        // Extract the remote name (everything before the last /<branch>)
-        let suffix = format!("/{}", self.name);
-        let remotes: Vec<String> = output
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                // Strip the branch suffix to get the remote name
-                line.strip_suffix(&suffix).map(String::from)
-            })
-            .collect();
-
-        Ok(remotes)
+        Ok(self
+            .repo
+            .remote_branches()?
+            .iter()
+            .filter(|r| r.local_name == self.name)
+            .map(|r| r.remote_name.clone())
+            .collect())
     }
 
     /// Get the upstream tracking branch for this branch.
     ///
-    /// Uses [`@{upstream}` syntax][1] to resolve the tracking branch.
+    /// Reads from the repository's local-branch inventory (see
+    /// [`Repository::local_branches`]). The first call within a command
+    /// triggers the `refs/heads/` scan that populates the inventory;
+    /// subsequent lookups are O(1). Returns `None` when no upstream is
+    /// configured, when no local branch by this name exists, or when the
+    /// configured upstream is gone from its remote (git's `[gone]` track
+    /// state).
     ///
-    /// [1]: https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-emltaboranchgtemuaboranchgtupaboranchgtupstream
+    /// [`Repository::local_branches`]: super::Repository::local_branches
     pub fn upstream(&self) -> anyhow::Result<Option<String>> {
-        let result =
-            self.repo
-                .run_command(&["rev-parse", "--abbrev-ref", &format!("{}@{{u}}", self.name)]);
-
-        match result {
-            Ok(upstream) => {
-                let trimmed = upstream.trim();
-                Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
-            }
-            Err(_) => Ok(None), // No upstream configured
-        }
+        Ok(self
+            .repo
+            .local_branch(&self.name)?
+            .and_then(|b| b.upstream_short.clone()))
     }
 
     /// Unset the upstream tracking branch for this branch.

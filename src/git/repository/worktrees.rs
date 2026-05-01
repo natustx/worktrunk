@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 
 use color_print::cformat;
 use dunce::canonicalize;
-use normalize_path::NormalizePath;
 
 use super::{GitError, Repository, ResolvedWorktree, WorktreeInfo};
-use crate::path::format_path_for_display;
+use crate::path::{format_path_for_display, paths_match};
 
 impl Repository {
     /// List all worktrees for this repository.
@@ -18,59 +17,47 @@ impl Repository {
     /// the main worktree. For bare repos, the bare entry is filtered out, so `[0]`
     /// is the first linked worktree (no semantic "main" exists).
     ///
-    /// Returns an empty vec for bare repos with no linked worktrees.
-    pub fn list_worktrees(&self) -> anyhow::Result<Vec<WorktreeInfo>> {
-        let stdout = self.run_command(&["worktree", "list", "--porcelain"])?;
-        let raw_worktrees = WorktreeInfo::parse_porcelain_list(&stdout)?;
-        let mut worktrees: Vec<_> = raw_worktrees.into_iter().filter(|wt| !wt.bare).collect();
-
-        // Submodule path correction.
-        //
-        // Git's `get_main_worktree()` computes the main worktree path by stripping
-        // a trailing `/.git` from the common dir. For submodules, the common dir is
-        // `.git/modules/sub` (no trailing `/.git`), so git leaves it unchanged —
-        // reporting the git data directory as the "main worktree" path. Git does not
-        // consult `core.worktree` in this code path.
-        //
-        // We detect this by checking whether the first worktree's path equals
-        // git_common_dir (which never holds for normal repos, where git_common_dir
-        // is `.git` inside the worktree). When matched, we correct it using
-        // repo_path(), which resolves the actual working directory via
-        // `git rev-parse --show-toplevel` (which does read core.worktree).
-        //
-        // We fix this here rather than at each call site because list_worktrees()
-        // is the single point where worktree paths enter the system — all consumers
-        // (worktree_for_branch, current_worktree_info, resolve_worktree, etc.)
-        // depend on paths being working directories. If git fixes this upstream,
-        // the condition stops triggering.
-        if let Some(first) = worktrees.first_mut()
-            && canonicalize(&first.path).ok().as_deref() == Some(self.git_common_dir())
-        {
-            first.path = self.repo_path()?.to_path_buf();
-        }
-
-        Ok(worktrees)
-    }
-
-    /// Get the WorktreeInfo struct for the current worktree, if we're inside one.
+    /// Returns an empty slice for bare repos with no linked worktrees.
     ///
-    /// Returns `None` if not in a worktree (e.g., in bare repo directory).
-    ///
-    /// Note: For worktree-specific operations, use [`current_worktree()`](Self::current_worktree)
-    /// to get a [`WorkingTree`](super::WorkingTree) instead.
-    pub fn current_worktree_info(&self) -> anyhow::Result<Option<WorktreeInfo>> {
-        // root() returns canonicalized path, so canonicalize worktree paths for comparison
-        // to handle symlinks (e.g., macOS /var -> /private/var)
-        let current_path = match self.current_worktree().root() {
-            Ok(p) => p,
-            Err(_) => return Ok(None),
-        };
-        let worktrees = self.list_worktrees()?;
-        Ok(worktrees.into_iter().find(|wt| {
-            canonicalize(&wt.path)
-                .map(|p| p == current_path)
-                .unwrap_or(false)
-        }))
+    /// Cached on `RepoCache` after the first successful call; subsequent calls
+    /// return a reference into the cache. See the module-level `# Caching` docs
+    /// for the "no post-mutation reads through the cache" invariant.
+    pub fn list_worktrees(&self) -> anyhow::Result<&[WorktreeInfo]> {
+        self.cache
+            .worktrees
+            .get_or_try_init(|| {
+                let stdout = self.run_command(&["worktree", "list", "--porcelain"])?;
+                let raw_worktrees = WorktreeInfo::parse_porcelain_list(&stdout)?;
+                let mut worktrees: Vec<_> =
+                    raw_worktrees.into_iter().filter(|wt| !wt.bare).collect();
+
+                // Submodule path correction.
+                //
+                // Git's `get_main_worktree()` computes the main worktree path by stripping
+                // a trailing `/.git` from the common dir. For submodules, the common dir is
+                // `.git/modules/sub` (no trailing `/.git`), so git leaves it unchanged —
+                // reporting the git data directory as the "main worktree" path. Git does not
+                // consult `core.worktree` in this code path.
+                //
+                // We detect this by checking whether the first worktree's path equals
+                // git_common_dir (which never holds for normal repos, where git_common_dir
+                // is `.git` inside the worktree). When matched, we correct it using
+                // repo_path(), which reads `core.worktree` from the bulk config map.
+                //
+                // We fix this here rather than at each call site because list_worktrees()
+                // is the single point where worktree paths enter the system — all consumers
+                // (worktree_for_branch, resolve_worktree, etc.) depend on paths being
+                // working directories. If git fixes this upstream, the condition stops
+                // triggering.
+                if let Some(first) = worktrees.first_mut()
+                    && canonicalize(&first.path).ok().as_deref() == Some(self.git_common_dir())
+                {
+                    first.path = self.repo_path()?.to_path_buf();
+                }
+
+                Ok(worktrees)
+            })
+            .map(Vec::as_slice)
     }
 
     /// Find the worktree path for a given branch, if one exists.
@@ -102,17 +89,18 @@ impl Repository {
     ///
     /// Returns `Some((path, branch))` if a worktree exists at the path,
     /// where `branch` is `None` for detached HEAD worktrees.
+    ///
+    /// Uses symlink-aware comparison so a path that resolves to a worktree
+    /// through one or more symlinks still matches the worktree's recorded path.
     pub fn worktree_at_path(
         &self,
         path: &Path,
     ) -> anyhow::Result<Option<(PathBuf, Option<String>)>> {
         let worktrees = self.list_worktrees()?;
-        // Use lexical normalization so comparison works even when path doesn't exist
-        let normalized_path = path.normalize();
 
         Ok(worktrees
             .iter()
-            .find(|wt| wt.path.normalize() == normalized_path)
+            .find(|wt| paths_match(&wt.path, path))
             .map(|wt| (wt.path.clone(), wt.branch.clone())))
     }
 

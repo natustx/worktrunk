@@ -53,8 +53,8 @@
 //! For each worktree, we execute:
 //! - `git status --porcelain` - Working tree state (uses index cache)
 //! - `git rev-list --count <base>..<head>` - Ahead/behind counts (uses commit graph)
-//! - `git diff --numstat HEAD` - Working tree line diffs (uses index + tree objects)
-//! - `git diff --numstat <base>...<head>` - Branch line diffs (uses tree objects)
+//! - `git diff --shortstat HEAD` - Working tree line diffs (uses index + tree objects)
+//! - `git diff --shortstat <base>...<head>` - Branch line diffs (uses tree objects)
 //! - `git rev-parse <ref>` - Ref resolution (uses ref cache)
 //!
 //! Plus one global command:
@@ -111,7 +111,7 @@
 //! Bottlenecks:
 //! 1. `git status --porcelain` - Slowest when index is cold or many files changed
 //! 2. `git rev-list --count` - Slow without commit graph in repos with deep history
-//! 3. `git diff --numstat` - Slow for large diffs or when pack files aren't cached
+//! 3. `git diff --shortstat` - Slow for large diffs or when pack files aren't cached
 //!
 //! Optimization tips:
 //! - Run `git commit-graph write --reachable --changed-paths` to speed up commit counting
@@ -131,11 +131,11 @@ pub(crate) mod render;
 #[cfg(test)]
 mod spacing_test;
 
-// Layout is calculated in collect.rs
+// Layout is calculated in collect/mod.rs
 use anstyle::Style;
 use anyhow::Context;
 use model::{ListData, ListItem};
-use progressive::RenderMode;
+use progressive::RenderTarget;
 use worktrunk::git::Repository;
 use worktrunk::styling::INFO_SYMBOL;
 
@@ -149,24 +149,9 @@ pub fn handle_list(
     cli_branches: bool,
     cli_remotes: bool,
     cli_full: bool,
-    render_mode: RenderMode,
+    progressive_flag: Option<bool>,
 ) -> anyhow::Result<()> {
-    // Progressive rendering only for table format with Progressive mode
-    let show_progress = match format {
-        crate::OutputFormat::Table | crate::OutputFormat::ClaudeCode => {
-            render_mode == RenderMode::Progressive
-        }
-        crate::OutputFormat::Json => false, // JSON never shows progress
-    };
-
-    // Render table in collect() for all table modes (progressive + buffered)
-    let render_table = matches!(
-        format,
-        crate::OutputFormat::Table | crate::OutputFormat::ClaudeCode
-    );
-
-    // For testing: allow enabling skip_expensive_for_stale via env var
-    let skip_expensive_for_stale = std::env::var("WORKTRUNK_TEST_SKIP_EXPENSIVE_THRESHOLD").is_ok();
+    let render_target = RenderTarget::detect(format, progressive_flag);
 
     let list_data = collect::collect(
         &repo,
@@ -175,28 +160,20 @@ pub fn handle_list(
             cli_remotes,
             cli_full,
         },
-        show_progress,
-        render_table,
-        skip_expensive_for_stale,
+        render_target,
     )?;
 
     let Some(ListData { items, .. }) = list_data else {
         return Ok(());
     };
 
-    match format {
-        crate::OutputFormat::Json => {
-            // Convert to new JSON structure
-            let json_items = json_output::to_json_items(&items, &repo);
-            let json =
-                serde_json::to_string_pretty(&json_items).context("Failed to serialize to JSON")?;
-            println!("{}", json);
-        }
-        crate::OutputFormat::Table | crate::OutputFormat::ClaudeCode => {
-            // Table and summary already rendered in collect() for all modes
-            // Nothing to do here - collect() handles the complete table rendering
-        }
+    if matches!(render_target, RenderTarget::Json) {
+        let json_items = json_output::to_json_items(&items, &repo);
+        let json =
+            serde_json::to_string_pretty(&json_items).context("Failed to serialize to JSON")?;
+        println!("{}", json);
     }
+    // Table modes already rendered inside `collect()`.
 
     Ok(())
 }
@@ -223,11 +200,12 @@ impl SummaryMetrics {
         if let Some(_data) = item.worktree_data() {
             self.worktrees += 1;
             // Use status_symbols.working_tree which includes untracked files,
-            // not just working_tree_diff which only has tracked changes
+            // not just working_tree_diff which only has tracked changes.
+            // `None` means gate 1 hasn't resolved yet — don't count.
             if item
                 .status_symbols
-                .as_ref()
-                .is_some_and(|s| s.working_tree.is_dirty())
+                .working_tree
+                .is_some_and(|wt| wt.is_dirty())
             {
                 self.dirty_worktrees += 1;
             }
@@ -287,7 +265,7 @@ impl SummaryMetrics {
     }
 }
 
-/// Format a summary message for the given items (used by both collect.rs and mod.rs)
+/// Format a summary message for the given items (used by both collect/mod.rs and mod.rs)
 pub(crate) fn format_summary_message(
     items: &[ListItem],
     show_branches: bool,

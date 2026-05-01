@@ -8,6 +8,7 @@ mod error;
 mod parse;
 pub mod recover;
 pub mod remote_ref;
+pub mod remove;
 mod repository;
 mod url;
 
@@ -25,7 +26,7 @@ mod test;
 //
 // Heavy operations protected:
 // - git rev-list --count (accesses commit-graph via mmap)
-// - git diff --numstat (accesses pack files and indexes via mmap)
+// - git diff --shortstat (accesses pack files and indexes via mmap)
 use crate::sync::Semaphore;
 use std::sync::LazyLock;
 static HEAVY_OPS_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
@@ -52,9 +53,15 @@ pub use error::{
     // Error inspection functions
     add_hook_skip_hint,
     exit_code,
+    interrupt_exit_code,
 };
 pub use parse::{parse_porcelain_z, parse_untracked_files};
 pub use recover::{current_or_recover, cwd_removed_hint};
+pub use remove::{
+    BranchDeletionMode, BranchDeletionOutcome, BranchDeletionResult, RemovalOutput, RemoveOptions,
+    delete_branch_if_safe, remove_worktree_with_cleanup, stage_worktree_removal,
+};
+pub use repository::sha_cache;
 pub use repository::{Branch, Repository, ResolvedWorktree, WorkingTree, set_base_path};
 pub use url::GitRemoteUrl;
 pub use url::parse_owner_repo;
@@ -283,6 +290,43 @@ pub struct CompletionBranch {
     pub category: BranchCategory,
 }
 
+/// A single local branch entry from the branch inventory.
+///
+/// Populated by one `git for-each-ref refs/heads/` scan per Repository lifetime
+/// (see [`Repository::local_branches`]). Sorted by most recent commit first.
+#[derive(Debug, Clone)]
+pub struct LocalBranch {
+    /// Short branch name, e.g., "feature" (not "refs/heads/feature").
+    pub name: String,
+    /// Commit SHA this branch points at.
+    pub commit_sha: String,
+    /// Unix timestamp of the commit.
+    pub committer_ts: i64,
+    /// Upstream tracking ref (e.g., "origin/main"), if configured and present.
+    /// `None` when no upstream is set, or when the configured upstream is gone
+    /// (git reports `[gone]` via `%(upstream:track)`).
+    pub upstream_short: Option<String>,
+}
+
+/// A single remote-tracking branch entry from the branch inventory.
+///
+/// Populated by one `git for-each-ref refs/remotes/` scan per Repository
+/// lifetime (see [`Repository::remote_branches`]). `<remote>/HEAD` symrefs are
+/// excluded. Sorted by most recent commit first.
+#[derive(Debug, Clone)]
+pub struct RemoteBranch {
+    /// Remote-qualified name, e.g., "origin/feature".
+    pub short_name: String,
+    /// Commit SHA this remote ref points at.
+    pub commit_sha: String,
+    /// Unix timestamp of the commit.
+    pub committer_ts: i64,
+    /// Remote name, e.g., "origin".
+    pub remote_name: String,
+    /// Branch name without the remote prefix, e.g., "feature".
+    pub local_name: String,
+}
+
 // Re-export parsing helpers for internal use
 pub(crate) use parse::DefaultBranchName;
 
@@ -368,11 +412,14 @@ pub fn branch_tracks_ref(
     Copy,
     PartialEq,
     Eq,
-    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
     strum::Display,
     strum::EnumString,
     strum::EnumIter,
 )]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum HookType {
     PreSwitch,
@@ -385,6 +432,29 @@ pub enum HookType {
     PostMerge,
     PreRemove,
     PostRemove,
+}
+
+impl HookType {
+    /// True for `pre-*` hooks. `pre-*` hooks block the operation and propagate
+    /// failures fail-fast; `post-*` hooks run after success and default to
+    /// background-with-warn.
+    ///
+    /// Uses an exhaustive match (not `matches!`) so a new variant trips a
+    /// compile-time nudge instead of silently classifying as post-*.
+    pub fn is_pre(self) -> bool {
+        match self {
+            HookType::PreSwitch
+            | HookType::PreStart
+            | HookType::PreCommit
+            | HookType::PreMerge
+            | HookType::PreRemove => true,
+            HookType::PostSwitch
+            | HookType::PostStart
+            | HookType::PostCommit
+            | HookType::PostMerge
+            | HookType::PostRemove => false,
+        }
+    }
 }
 
 /// Reference to a branch for parallel task execution.
@@ -405,43 +475,42 @@ pub enum HookType {
 /// which returns `Some(WorkingTree)` only when this ref has a worktree path.
 #[derive(Debug, Clone)]
 pub struct BranchRef {
-    /// Branch name (e.g., "main", "feature/auth", "origin/feature").
-    /// None for detached HEAD.
-    pub branch: Option<String>,
+    /// Full git ref (e.g., `refs/heads/feature`, `refs/remotes/origin/feature`).
+    /// `None` for detached HEAD.
+    ///
+    /// Storing the full ref — rather than a short name plus a remote/local
+    /// flag — makes the ref unambiguous: git lets users create a local branch
+    /// literally named `origin/foo`, and `git rev-parse origin/foo` then picks
+    /// `refs/heads/origin/foo` over `refs/remotes/origin/foo`. With the full
+    /// ref there is nothing to disambiguate.
+    pub full_ref: Option<String>,
     /// Commit SHA this branch/worktree points to.
     pub commit_sha: String,
     /// Path to worktree, if this branch has one.
     /// None for branch-only items (remote branches, local branches without worktrees).
     pub worktree_path: Option<PathBuf>,
-    /// True if this is a remote-tracking ref (e.g., "origin/feature").
-    /// Remote branches inherently exist on the remote and don't need push config.
-    // TODO(full-refs): Consider refactoring to store full refs (e.g., "refs/remotes/origin/feature"
-    // or "refs/heads/feature") instead of short names + is_remote flag. Full refs are self-describing
-    // and unambiguous, but would require changes throughout the codebase and user input resolution.
-    pub is_remote: bool,
 }
 
 impl BranchRef {
     /// Create a BranchRef for a local branch without a worktree.
     pub fn local_branch(branch: &str, commit_sha: &str) -> Self {
         Self {
-            branch: Some(branch.to_string()),
+            full_ref: Some(format!("refs/heads/{branch}")),
             commit_sha: commit_sha.to_string(),
             worktree_path: None,
-            is_remote: false,
         }
     }
 
     /// Create a BranchRef for a remote-tracking branch.
     ///
-    /// Remote branches (e.g., "origin/feature") are refs under refs/remotes/.
-    /// They inherently exist on the remote and don't need upstream tracking config.
+    /// `branch` is the short remote-qualified name (e.g., `"origin/feature"`),
+    /// as produced by `%(refname:lstrip=2)` in `list_remote_branches`. It is
+    /// stored as `refs/remotes/<branch>`.
     pub fn remote_branch(branch: &str, commit_sha: &str) -> Self {
         Self {
-            branch: Some(branch.to_string()),
+            full_ref: Some(format!("refs/remotes/{branch}")),
             commit_sha: commit_sha.to_string(),
             worktree_path: None,
-            is_remote: true,
         }
     }
 
@@ -459,15 +528,59 @@ impl BranchRef {
     pub fn has_worktree(&self) -> bool {
         self.worktree_path.is_some()
     }
+
+    /// Full git ref (e.g., `refs/heads/feature`, `refs/remotes/origin/feature`),
+    /// suitable for passing to integration helpers that go through `git rev-parse`.
+    ///
+    /// Returns `None` for detached HEAD.
+    pub fn full_ref(&self) -> Option<&str> {
+        self.full_ref.as_deref()
+    }
+
+    /// Short display name (e.g., `feature`, `origin/feature`) with the
+    /// `refs/heads/` or `refs/remotes/` prefix stripped. Use for user-facing
+    /// output and APIs that expect short names (`git config branch.<name>.*`,
+    /// `gh pr view <branch>`).
+    ///
+    /// Returns `None` for detached HEAD.
+    ///
+    /// # Panics
+    ///
+    /// Every constructor on this type produces a `full_ref` starting with
+    /// `refs/heads/` or `refs/remotes/`; this panics if that invariant is
+    /// ever violated (e.g., by a future struct-literal caller). The panic
+    /// is the intended behavior — silently returning an unqualified ref
+    /// would re-open the shadowing class of bug this type exists to rule out.
+    pub fn short_name(&self) -> Option<&str> {
+        let r = self.full_ref.as_deref()?;
+        Some(
+            r.strip_prefix("refs/heads/")
+                .or_else(|| r.strip_prefix("refs/remotes/"))
+                .expect("BranchRef.full_ref must start with refs/heads/ or refs/remotes/"),
+        )
+    }
+
+    /// True if this is a remote-tracking ref (under `refs/remotes/`).
+    pub fn is_remote(&self) -> bool {
+        self.full_ref
+            .as_deref()
+            .is_some_and(|r| r.starts_with("refs/remotes/"))
+    }
 }
 
 impl From<&WorktreeInfo> for BranchRef {
     fn from(wt: &WorktreeInfo) -> Self {
+        // `WorktreeInfo.branch` is the short form produced by
+        // `parse_porcelain_list` (one `refs/heads/` prefix stripped). Worktrees
+        // always point at local branches, so re-qualifying with `refs/heads/`
+        // gives the full ref. Note: git permits a branch literally named
+        // `refs/heads/foo`; in that case `wt.branch == "refs/heads/foo"` and
+        // this produces `refs/heads/refs/heads/foo` — which is the correct full
+        // ref for that pathological branch, so we don't special-case it.
         Self {
-            branch: wt.branch.clone(),
+            full_ref: wt.branch.as_deref().map(|b| format!("refs/heads/{b}")),
             commit_sha: wt.head.clone(),
             worktree_path: Some(wt.path.clone()),
-            is_remote: false, // Worktrees are always local
         }
     }
 }
@@ -762,176 +875,183 @@ mod tests {
 
         let branch_ref = BranchRef::from(&wt);
 
-        assert_eq!(branch_ref.branch, Some("feature".to_string()));
+        assert_eq!(branch_ref.full_ref(), Some("refs/heads/feature"));
+        assert_eq!(branch_ref.short_name(), Some("feature"));
         assert_eq!(branch_ref.commit_sha, "abc123");
         assert_eq!(
             branch_ref.worktree_path,
             Some(PathBuf::from("/repo.feature"))
         );
         assert!(branch_ref.has_worktree());
-        assert!(!branch_ref.is_remote); // Worktrees are always local
+        assert!(!branch_ref.is_remote()); // Worktrees are always local
     }
 
     #[test]
     fn test_branch_ref_local_branch() {
         let branch_ref = BranchRef::local_branch("feature", "abc123");
 
-        assert_eq!(branch_ref.branch, Some("feature".to_string()));
+        assert_eq!(branch_ref.full_ref(), Some("refs/heads/feature"));
+        assert_eq!(branch_ref.short_name(), Some("feature"));
         assert_eq!(branch_ref.commit_sha, "abc123");
         assert_eq!(branch_ref.worktree_path, None);
         assert!(!branch_ref.has_worktree());
-        assert!(!branch_ref.is_remote);
+        assert!(!branch_ref.is_remote());
     }
 
     #[test]
     fn test_branch_ref_remote_branch() {
         let branch_ref = BranchRef::remote_branch("origin/feature", "abc123");
 
-        assert_eq!(branch_ref.branch, Some("origin/feature".to_string()));
+        assert_eq!(branch_ref.full_ref(), Some("refs/remotes/origin/feature"));
+        assert_eq!(branch_ref.short_name(), Some("origin/feature"));
         assert_eq!(branch_ref.commit_sha, "abc123");
         assert_eq!(branch_ref.worktree_path, None);
         assert!(!branch_ref.has_worktree());
-        assert!(branch_ref.is_remote);
+        assert!(branch_ref.is_remote());
     }
 
-    /// Create a git repo with one commit and return the TempDir + repo path.
-    fn init_test_repo() -> (tempfile::TempDir, PathBuf) {
-        use crate::shell_exec::Cmd;
+    #[test]
+    fn test_branch_ref_full_ref_disambiguates_remote_from_local() {
+        // Git allows local branches literally named `origin/foo`. Full refs
+        // make the two distinguishable even though they share a short name.
+        //
+        // This pins the type-level contract; the end-to-end guardrail against
+        // `git rev-parse` picking the wrong ref lives at
+        // `test_list_remote_row_not_shadowed_by_same_named_local_branch` in
+        // `tests/integration_tests/list.rs`.
+        let remote = BranchRef::remote_branch("origin/foo", "abc");
+        let local = BranchRef::local_branch("origin/foo", "def");
 
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        Cmd::new("git")
-            .args(["init", "--initial-branch=main", repo.to_str().unwrap()])
-            .run()
-            .unwrap();
-        Cmd::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&repo)
-            .run()
-            .unwrap();
-        Cmd::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&repo)
-            .run()
-            .unwrap();
-        std::fs::write(repo.join("file.txt"), "hello").unwrap();
-        Cmd::new("git")
-            .args(["add", "."])
-            .current_dir(&repo)
-            .run()
-            .unwrap();
-        Cmd::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&repo)
-            .run()
-            .unwrap();
-        (tmp, repo)
+        assert_eq!(remote.full_ref(), Some("refs/remotes/origin/foo"));
+        assert_eq!(local.full_ref(), Some("refs/heads/origin/foo"));
+        assert_eq!(remote.short_name(), Some("origin/foo"));
+        assert_eq!(local.short_name(), Some("origin/foo"));
+        assert!(remote.is_remote());
+        assert!(!local.is_remote());
+    }
+
+    #[test]
+    fn test_branch_ref_detached_has_no_ref() {
+        // Detached HEAD has no branch name — callers fall back to commit_sha.
+        let detached = BranchRef {
+            full_ref: None,
+            commit_sha: "abc".into(),
+            worktree_path: None,
+        };
+        assert_eq!(detached.full_ref(), None);
+        assert_eq!(detached.short_name(), None);
+        assert!(!detached.is_remote());
     }
 
     #[test]
     fn test_branch_tracks_ref_matching() {
-        let (_tmp, repo) = init_test_repo();
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
 
         // Create a branch and set its merge config to a PR ref
         crate::shell_exec::Cmd::new("git")
             .args(["branch", "pr-branch"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
             .args(["config", "branch.pr-branch.merge", "refs/pull/101/head"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
             .args(["config", "branch.pr-branch.remote", "origin"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
 
         assert_eq!(
-            branch_tracks_ref(&repo, "pr-branch", "refs/pull/101/head", None),
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/101/head", None),
             Some(true),
         );
         assert_eq!(
-            branch_tracks_ref(&repo, "pr-branch", "refs/pull/101/head", Some("origin")),
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/101/head", Some("origin")),
             Some(true),
         );
     }
 
     #[test]
     fn test_branch_tracks_ref_different_ref() {
-        let (_tmp, repo) = init_test_repo();
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
 
         crate::shell_exec::Cmd::new("git")
             .args(["branch", "pr-branch"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
             .args(["config", "branch.pr-branch.merge", "refs/pull/101/head"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
 
         // Ask about a different ref — should return Some(false)
         assert_eq!(
-            branch_tracks_ref(&repo, "pr-branch", "refs/pull/999/head", None),
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/999/head", None),
             Some(false),
         );
     }
 
     #[test]
     fn test_branch_tracks_ref_wrong_remote() {
-        let (_tmp, repo) = init_test_repo();
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
 
         crate::shell_exec::Cmd::new("git")
             .args(["branch", "pr-branch"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
             .args(["config", "branch.pr-branch.merge", "refs/pull/101/head"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
             .args(["config", "branch.pr-branch.remote", "fork"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
 
         assert_eq!(
-            branch_tracks_ref(&repo, "pr-branch", "refs/pull/101/head", Some("origin")),
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/101/head", Some("origin")),
             Some(false),
         );
     }
 
     #[test]
     fn test_branch_tracks_ref_no_tracking_config() {
-        let (_tmp, repo) = init_test_repo();
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
 
         // Create a branch with no tracking config
         crate::shell_exec::Cmd::new("git")
             .args(["branch", "local-only"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
 
         // Branch exists but has no merge config — Some(false)
         assert_eq!(
-            branch_tracks_ref(&repo, "local-only", "refs/pull/1/head", None),
+            branch_tracks_ref(repo, "local-only", "refs/pull/1/head", None),
             Some(false),
         );
     }
 
     #[test]
     fn test_branch_tracks_ref_nonexistent_branch() {
-        let (_tmp, repo) = init_test_repo();
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
 
         // Branch doesn't exist at all — None
         assert_eq!(
-            branch_tracks_ref(&repo, "no-such-branch", "refs/pull/1/head", None),
+            branch_tracks_ref(repo, "no-such-branch", "refs/pull/1/head", None),
             None,
         );
     }
@@ -948,12 +1068,13 @@ mod tests {
 
     #[test]
     fn test_branch_tracks_ref_mr_ref() {
-        let (_tmp, repo) = init_test_repo();
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
 
         // Test with GitLab-style MR ref
         crate::shell_exec::Cmd::new("git")
             .args(["branch", "mr-branch"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
@@ -962,18 +1083,18 @@ mod tests {
                 "branch.mr-branch.merge",
                 "refs/merge-requests/42/head",
             ])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
         crate::shell_exec::Cmd::new("git")
             .args(["config", "branch.mr-branch.remote", "origin"])
-            .current_dir(&repo)
+            .current_dir(repo)
             .run()
             .unwrap();
 
         assert_eq!(
             branch_tracks_ref(
-                &repo,
+                repo,
                 "mr-branch",
                 "refs/merge-requests/42/head",
                 Some("origin"),
@@ -981,7 +1102,7 @@ mod tests {
             Some(true),
         );
         assert_eq!(
-            branch_tracks_ref(&repo, "mr-branch", "refs/pull/42/head", Some("origin")),
+            branch_tracks_ref(repo, "mr-branch", "refs/pull/42/head", Some("origin")),
             Some(false),
         );
     }
@@ -1000,7 +1121,8 @@ mod tests {
 
         let branch_ref = BranchRef::from(&wt);
 
-        assert_eq!(branch_ref.branch, None);
+        assert_eq!(branch_ref.full_ref(), None);
+        assert_eq!(branch_ref.short_name(), None);
         assert_eq!(branch_ref.commit_sha, "def456");
         assert!(branch_ref.has_worktree());
     }

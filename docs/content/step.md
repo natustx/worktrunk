@@ -15,7 +15,11 @@ Run individual operations. The building blocks of wt merge — commit, squash, r
 
 Commit with LLM-generated message:
 
-{{ terminal(cmd="wt step commit") }}
+{% terminal(cmd="wt step commit") %}
+<span class=c>◎</span> <span class=c>Generating commit message and committing changes... <span style='color:var(--bright-black,#555)'>(2 files, <span class=g>+26</span></span></span><span style='color:var(--bright-black,#555)'>)</span>
+<span style='background:var(--bright-white,#fff)'> </span> <b>feat(validation): add input validation utilities</b>
+<span class=g>✓</span> <span class=g>Committed changes @ <span class=d>a1b2c3d</span></span>
+{% end %}
 
 Manual merge workflow with review between steps:
 
@@ -34,12 +38,13 @@ Manual merge workflow with review between steps:
 - [`promote`](#wt-step-promote) — <span class="badge-experimental"></span> Swap a branch into the main worktree
 - [`prune`](#wt-step-prune) — Remove worktrees and branches merged into the default branch
 - [`relocate`](#wt-step-relocate) — <span class="badge-experimental"></span> Move worktrees to expected paths
-- [`<alias>`](#aliases) — <span class="badge-experimental"></span> Run a configured command alias
+- [`<alias>`](@/extending.md#aliases) — Run a configured command alias
 
 ## See also
 
 - [`wt merge`](@/merge.md) — Runs commit → squash → rebase → hooks → push → cleanup automatically
 - [`wt hook`](@/hook.md) — Run configured hooks
+- [Aliases](@/extending.md#aliases) — Custom command templates run as `wt <name>`
 
 ## Command reference
 
@@ -53,8 +58,8 @@ Usage: <b><span class=c>wt step</span></b> <span class=c>[OPTIONS]</span> <span 
 <b><span class=g>Commands:</span></b>
   <b><span class=c>commit</span></b>        Stage and commit with LLM-generated message
   <b><span class=c>squash</span></b>        Squash commits since branching
-  <b><span class=c>push</span></b>          Fast-forward target to current branch
   <b><span class=c>rebase</span></b>        Rebase onto target
+  <b><span class=c>push</span></b>          Fast-forward target to current branch
   <b><span class=c>diff</span></b>          Show all changes since branching
   <b><span class=c>copy-ignored</span></b>  Copy gitignored files to another worktree
   <b><span class=c>eval</span></b>          [experimental] Evaluate a template expression
@@ -75,7 +80,11 @@ Usage: <b><span class=c>wt step</span></b> <span class=c>[OPTIONS]</span> <span 
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 # Subcommands
@@ -124,6 +133,9 @@ Usage: <b><span class=c>wt step commit</span></b> <span class=c>[OPTIONS]</span>
   <b><span class=c>-b</span></b>, <b><span class=c>--branch</span></b><span class=c> &lt;BRANCH&gt;</span>
           Branch to operate on (defaults to current worktree)
 
+      <b><span class=c>--no-hooks</span></b>
+          Skip hooks
+
       <b><span class=c>--stage</span></b><span class=c> &lt;STAGE&gt;</span>
           What to stage before committing [default: all]
 
@@ -140,13 +152,6 @@ Usage: <b><span class=c>wt step commit</span></b> <span class=c>[OPTIONS]</span>
   <b><span class=c>-h</span></b>, <b><span class=c>--help</span></b>
           Print help (see a summary with &#39;-h&#39;)
 
-<b><span class=g>Automation:</span></b>
-  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
-          Skip approval prompts
-
-      <b><span class=c>--no-verify</span></b>
-          Skip hooks
-
 <b><span class=g>Global Options:</span></b>
   <b><span class=c>-C</span></b><span class=c> &lt;path&gt;</span>
           Working directory for this command
@@ -155,7 +160,11 @@ Usage: <b><span class=c>wt step commit</span></b> <span class=c>[OPTIONS]</span>
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step squash
@@ -207,6 +216,9 @@ Usage: <b><span class=c>wt step squash</span></b> <span class=c>[OPTIONS]</span>
           Defaults to default branch.
 
 <b><span class=g>Options:</span></b>
+      <b><span class=c>--no-hooks</span></b>
+          Skip hooks
+
       <b><span class=c>--stage</span></b><span class=c> &lt;STAGE&gt;</span>
           What to stage before committing [default: all]
 
@@ -223,13 +235,6 @@ Usage: <b><span class=c>wt step squash</span></b> <span class=c>[OPTIONS]</span>
   <b><span class=c>-h</span></b>, <b><span class=c>--help</span></b>
           Print help (see a summary with &#39;-h&#39;)
 
-<b><span class=g>Automation:</span></b>
-  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
-          Skip approval prompts
-
-      <b><span class=c>--no-verify</span></b>
-          Skip hooks
-
 <b><span class=g>Global Options:</span></b>
   <b><span class=c>-C</span></b><span class=c> &lt;path&gt;</span>
           Working directory for this command
@@ -238,7 +243,11 @@ Usage: <b><span class=c>wt step squash</span></b> <span class=c>[OPTIONS]</span>
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step diff
@@ -295,7 +304,11 @@ Usage: <b><span class=c>wt step diff</span></b> <span class=c>[OPTIONS]</span> <
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step copy-ignored
@@ -362,6 +375,12 @@ Uses per-file reflink (like `cp -Rc`) — copy time scales with file count.
 
 Use the `post-start` hook so the copy runs in the background. Use `pre-start` instead if subsequent hooks or `--execute` command need the copied files immediately.
 
+### Background-hook priority (experimental)
+
+When invoked from a background hook pipeline (`post-*` hooks), `wt step copy-ignored` self-lowers its CPU and I/O priority — `taskpolicy -b` on macOS, `nice -n 19` plus `ionice -c 3` on Linux — so it yields to interactive work. Foreground callers (`pre-*` hooks, direct interactive use) run at normal priority so the user isn't waiting on a throttled copy.
+
+wt signals background-hook context by exporting `WORKTRUNK_FOREGROUND=-1` into every detached hook pipeline; `copy-ignored` inspects that variable on entry. The variable name is experimental and may change.
+
 ### Language-specific notes
 
 #### Rust
@@ -426,7 +445,11 @@ Usage: <b><span class=c>wt step copy-ignored</span></b> <span class=c>[OPTIONS]<
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step eval
@@ -441,29 +464,29 @@ All [hook template variables and filters](@/hook.md#template-variables) are avai
 
 Get the port for the current branch:
 
-{% terminal(cmd="wt step eval '__WT_OPEN2__ branch | hash_port __WT_CLOSE2__'") %}
+{% terminal(cmd="wt step eval '__WT_OPEN__ branch | hash_port __WT_CLOSE__'") %}
 16066
 {% end %}
 
 Use in shell substitution:
 
-{{ terminal(cmd="curl http://localhost:$(wt step eval '__WT_OPEN2__ branch | hash_port __WT_CLOSE2__')/health") }}
+{{ terminal(cmd="curl http://localhost:$(wt step eval '__WT_OPEN__ branch | hash_port __WT_CLOSE__')/health") }}
 
 Combine multiple values:
 
-{% terminal(cmd="wt step eval '__WT_OPEN2__ branch | hash_port __WT_CLOSE2__,__WT_OPEN2__ (__WT_QUOT__supabase-api-__WT_QUOT__ ~ branch) | hash_port __WT_CLOSE2__'") %}
+{% terminal(cmd="wt step eval '__WT_OPEN__ branch | hash_port __WT_CLOSE__,__WT_OPEN__ (__WT_QUOT__supabase-api-__WT_QUOT__ ~ branch) | hash_port __WT_CLOSE__'") %}
 16066,16739
 {% end %}
 
 Use conditionals and filters:
 
-{% terminal(cmd="wt step eval '__WT_OPEN2__ branch | sanitize_db __WT_CLOSE2__'") %}
+{% terminal(cmd="wt step eval '__WT_OPEN__ branch | sanitize_db __WT_CLOSE__'") %}
 feature_auth_oauth2_a1b
 {% end %}
 
 Show available template variables:
 
-{% terminal(cmd="wt step eval --dry-run '__WT_OPEN2__ branch __WT_CLOSE2__'") %}
+{% terminal(cmd="wt step eval --dry-run '__WT_OPEN__ branch __WT_CLOSE__'") %}
 branch=feature/auth-oauth2
 worktree_path=/home/user/projects/myapp-feature-auth-oauth2
 ...
@@ -500,7 +523,11 @@ Usage: <b><span class=c>wt step eval</span></b> <span class=c>[OPTIONS]</span> <
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step for-each
@@ -527,7 +554,7 @@ Run npm install in all worktrees:
 
 Use branch name in command:
 
-{{ terminal(cmd="wt step for-each -- __WT_QUOT__echo Branch: __WT_OPEN2__ branch __WT_CLOSE2____WT_QUOT__") }}
+{{ terminal(cmd="wt step for-each -- __WT_QUOT__echo Branch: __WT_OPEN__ branch __WT_CLOSE____WT_QUOT__") }}
 
 Pull updates in worktrees with upstreams (skips others):
 
@@ -549,6 +576,15 @@ Usage: <b><span class=c>wt step for-each</span></b> <span class=c>[OPTIONS]</spa
           Command template (see --help for all variables)
 
 <b><span class=g>Options:</span></b>
+      <b><span class=c>--format</span></b><span class=c> &lt;FORMAT&gt;</span>
+          Output format (text, json)
+
+          Possible values:
+          - <b><span class=c>text</span></b>: Human-readable text output
+          - <b><span class=c>json</span></b>: JSON output
+
+          [default: text]
+
   <b><span class=c>-h</span></b>, <b><span class=c>--help</span></b>
           Print help (see a summary with &#39;-h&#39;)
 
@@ -560,7 +596,11 @@ Usage: <b><span class=c>wt step for-each</span></b> <span class=c>[OPTIONS]</spa
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step promote
@@ -633,7 +673,11 @@ Usage: <b><span class=c>wt step promote</span></b> <span class=c>[OPTIONS]</span
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step prune
@@ -683,12 +727,17 @@ Usage: <b><span class=c>wt step prune</span></b> <span class=c>[OPTIONS]</span>
       <b><span class=c>--foreground</span></b>
           Run removal in foreground (block until complete)
 
+      <b><span class=c>--format</span></b><span class=c> &lt;FORMAT&gt;</span>
+          Output format (text, json)
+
+          Possible values:
+          - <b><span class=c>text</span></b>: Human-readable text output
+          - <b><span class=c>json</span></b>: JSON output
+
+          [default: text]
+
   <b><span class=c>-h</span></b>, <b><span class=c>--help</span></b>
           Print help (see a summary with &#39;-h&#39;)
-
-<b><span class=g>Automation:</span></b>
-  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
-          Skip approval prompts
 
 <b><span class=g>Global Options:</span></b>
   <b><span class=c>-C</span></b><span class=c> &lt;path&gt;</span>
@@ -698,7 +747,11 @@ Usage: <b><span class=c>wt step prune</span></b> <span class=c>[OPTIONS]</span>
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
 ## wt step relocate
@@ -787,26 +840,11 @@ Usage: <b><span class=c>wt step relocate</span></b> <span class=c>[OPTIONS]</spa
           User config file path
 
   <b><span class=c>-v</span></b>, <b><span class=c>--verbose</span></b><span class=c>...</span>
-          Verbose output (-v: hooks, templates; -vv: debug report)
+          Verbose output (-v: info logs + hook/alias template variable &amp; output; -vv: debug logs +
+          diagnostic report + trace.log/output.log under .git/wt/logs/)
+
+  <b><span class=c>-y</span></b>, <b><span class=c>--yes</span></b>
+          Skip approval prompts
 {% end %}
 
-## Aliases
-
-<span class="badge-experimental"></span>
-
-Custom command templates configured in user config (`~/.config/worktrunk/config.toml`) or project config (`.config/wt.toml`). Aliases support the same [template variables](@/hook.md#template-variables) as hooks.
-
-```toml
-# .config/wt.toml
-[aliases]
-deploy = "make deploy BRANCH={{ branch }}"
-port = "echo http://localhost:{{ branch | hash_port }}"
-```
-
-{{ terminal(cmd="wt step deploy                            # run the alias|||wt step deploy --dry-run                  # show expanded command|||wt step deploy --var env=staging          # pass extra template variables|||wt step deploy --yes                      # skip approval prompt") }}
-
-When defined in both user and project config, both run — user first, then project. Project-config aliases require [command approval](@/hook.md#wt-hook-approvals) on first run, same as project hooks. User-config aliases are trusted.
-
-Alias names that match a built-in step command (`commit`, `squash`, etc.) are shadowed by the built-in and will never run.
-
-<!-- END AUTO-GENERATED from `wt step --help-page` -->
+<!-- END AUTO-GENERATED -->

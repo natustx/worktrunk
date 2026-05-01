@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use color_print::cformat;
 
+use crate::path::canonicalize_with_parents;
 use crate::styling::eprintln;
 
 use super::Repository;
@@ -177,52 +178,29 @@ fn was_worktree_of(repo: &Repository, deleted_path: &Path) -> bool {
 /// Compare worktree paths, accounting for the fact that the deleted path
 /// may not be canonical (e.g., symlinks in parent directories).
 ///
-/// Note: the symlink fallback only handles the case where `deleted_path` is
-/// the worktree root itself. If `deleted_path` is deeper (e.g., `.../wt/src/`)
-/// AND there are symlinks in the parent, this won't match. The `starts_with`
-/// check in `was_worktree_of` handles the non-symlink descendant case.
+/// Returns true when `deleted_path` is the worktree itself, or a descendant
+/// of it, after symlinks anywhere in the existing portion of either path are
+/// resolved. This covers the case where the shell entered a worktree through
+/// a symlinked spelling (`~/link/repo.feature/src`) and the worktree was then
+/// removed — neither the literal `starts_with` nor a same-`file_name` check
+/// matches such a path.
 fn paths_match(worktree_path: &Path, deleted_path: &Path) -> bool {
-    // Direct comparison first (includes descendant check via starts_with)
+    // Direct prefix check (covers the no-symlink case cheaply).
     if deleted_path.starts_with(worktree_path) {
         return true;
     }
 
-    // Symlink fallback: canonicalize parents and compare the final component.
-    // Only handles exact match (same final component), not descendants.
-    let wt_name = worktree_path.file_name();
-    let del_name = deleted_path.file_name();
-    if wt_name != del_name {
-        return false;
-    }
-
-    let wt_parent = worktree_path
-        .parent()
-        .and_then(|p| dunce::canonicalize(p).ok());
-    let del_parent = deleted_path
-        .parent()
-        .and_then(|p| dunce::canonicalize(p).ok());
-    matches!((wt_parent, del_parent), (Some(a), Some(b)) if a == b)
+    // Canonicalize the existing prefix of each path so symlinked spellings
+    // collapse to the real on-disk path, then compare with starts_with so a
+    // descendant of the worktree still matches.
+    canonicalize_with_parents(deleted_path).starts_with(canonicalize_with_parents(worktree_path))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell_exec::Cmd;
+    use crate::testing::TestRepo;
     use ansi_str::AnsiStr;
-
-    fn git_init(path: &Path) {
-        Cmd::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(path)
-            .run()
-            .unwrap();
-    }
-
-    fn configure_test_identity(repo: &Repository) {
-        repo.run_command(&["config", "user.name", "Test"]).unwrap();
-        repo.run_command(&["config", "user.email", "test@test.com"])
-            .unwrap();
-    }
 
     #[test]
     fn test_try_repo_at_rejects_git_file() {
@@ -234,9 +212,8 @@ mod tests {
 
     #[test]
     fn test_try_repo_at_accepts_git_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        assert!(try_repo_at(tmp.path()).is_some());
+        let test = TestRepo::new();
+        assert!(try_repo_at(test.path()).is_some());
     }
 
     #[test]
@@ -282,37 +259,25 @@ mod tests {
     #[test]
     fn test_was_worktree_of_finds_existing_worktree() {
         let tmp = tempfile::tempdir().unwrap();
-        // Canonicalize to handle symlinks (e.g., /tmp -> /private/tmp on macOS)
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        let repo_dir = base.join("repo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        git_init(&repo_dir);
-        let repo = Repository::at(&repo_dir).unwrap();
-        configure_test_identity(&repo);
-        // Create an initial commit so worktree add works
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
+        let test = TestRepo::at(&base.join("repo"));
+        test.commit("init");
 
         // Add a linked worktree
         let wt_path = base.join("feature-wt");
         let wt_str = wt_path.to_string_lossy();
-        repo.run_command(&["worktree", "add", &wt_str, "-b", "feature"])
+        test.repo
+            .run_command(&["worktree", "add", &wt_str, "-b", "feature"])
             .unwrap();
 
-        assert!(was_worktree_of(&repo, &wt_path));
+        assert!(was_worktree_of(&test.repo, &wt_path));
     }
 
     #[test]
     fn test_was_worktree_of_rejects_unknown_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        let repo = Repository::at(tmp.path()).unwrap();
-        configure_test_identity(&repo);
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
-
+        let test = TestRepo::with_initial_commit();
         let unknown = PathBuf::from("/nonexistent/unknown");
-        assert!(!was_worktree_of(&repo, &unknown));
+        assert!(!was_worktree_of(&test.repo, &unknown));
     }
 
     #[test]
@@ -329,18 +294,14 @@ mod tests {
     fn test_recover_from_path_finds_deleted_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        let repo_dir = base.join("repo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        git_init(&repo_dir);
-        let repo = Repository::at(&repo_dir).unwrap();
-        configure_test_identity(&repo);
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
+        let test = TestRepo::at(&base.join("repo"));
+        test.commit("init");
 
         // Add a linked worktree
         let wt_path = base.join("feature-wt");
         let wt_str = wt_path.to_string_lossy();
-        repo.run_command(&["worktree", "add", &wt_str, "-b", "feature"])
+        test.repo
+            .run_command(&["worktree", "add", &wt_str, "-b", "feature"])
             .unwrap();
 
         // Delete the worktree directory (simulating external removal)
@@ -354,13 +315,8 @@ mod tests {
     fn test_recover_from_path_returns_none_for_unrelated_path() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        let repo_dir = base.join("repo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        git_init(&repo_dir);
-        let repo = Repository::at(&repo_dir).unwrap();
-        configure_test_identity(&repo);
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
+        let test = TestRepo::at(&base.join("repo"));
+        test.commit("init");
 
         // Try to recover from a path that was never a worktree
         let unrelated = base.join("not-a-worktree");
@@ -373,29 +329,21 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).unwrap();
 
         // Create two sibling repos
-        let repo_a = base.join("alpha");
-        let repo_b = base.join("beta");
-        std::fs::create_dir(&repo_a).unwrap();
-        std::fs::create_dir(&repo_b).unwrap();
-        git_init(&repo_a);
-        git_init(&repo_b);
-        let repo_a_handle = Repository::at(&repo_a).unwrap();
-        let repo_b_handle = Repository::at(&repo_b).unwrap();
-        for repo in [&repo_a_handle, &repo_b_handle] {
-            configure_test_identity(repo);
-            repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-                .unwrap();
-        }
+        let alpha = TestRepo::at(&base.join("alpha"));
+        let beta = TestRepo::at(&base.join("beta"));
+        alpha.commit("init");
+        beta.commit("init");
 
         // Add worktrees for both repos as siblings
         let wt_a = base.join("alpha.feature");
         let wt_b = base.join("beta.feature");
         let wt_a_str = wt_a.to_string_lossy();
         let wt_b_str = wt_b.to_string_lossy();
-        repo_a_handle
+        alpha
+            .repo
             .run_command(&["worktree", "add", &wt_a_str, "-b", "feature"])
             .unwrap();
-        repo_b_handle
+        beta.repo
             .run_command(&["worktree", "add", &wt_b_str, "-b", "feature"])
             .unwrap();
 
@@ -406,7 +354,7 @@ mod tests {
         let recovered = recover_from_path(&wt_b).unwrap();
         assert_eq!(
             dunce::canonicalize(recovered.repo_path().unwrap()).unwrap(),
-            repo_b
+            base.join("beta")
         );
     }
 
@@ -415,19 +363,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
 
-        let repo_dir = base.join("myrepo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        git_init(&repo_dir);
-        let repo = Repository::at(&repo_dir).unwrap();
-        configure_test_identity(&repo);
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
+        let test = TestRepo::at(&base.join("myrepo"));
+        test.commit("init");
 
         // Add a worktree nested under the repo
-        let wt_path = repo_dir.join(".worktrees").join("feature");
+        let wt_path = test.path().join(".worktrees").join("feature");
         std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
         let wt_str = wt_path.to_string_lossy();
-        repo.run_command(&["worktree", "add", &wt_str, "-b", "feature"])
+        test.repo
+            .run_command(&["worktree", "add", &wt_str, "-b", "feature"])
             .unwrap();
 
         // Delete the worktree
@@ -441,17 +385,13 @@ mod tests {
     fn test_recover_from_path_deep_pwd() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        let repo_dir = base.join("repo");
-        std::fs::create_dir(&repo_dir).unwrap();
-        git_init(&repo_dir);
-        let repo = Repository::at(&repo_dir).unwrap();
-        configure_test_identity(&repo);
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
+        let test = TestRepo::at(&base.join("repo"));
+        test.commit("init");
 
         let wt_path = base.join("feature-wt");
         let wt_str = wt_path.to_string_lossy();
-        repo.run_command(&["worktree", "add", &wt_str, "-b", "feature"])
+        test.repo
+            .run_command(&["worktree", "add", &wt_str, "-b", "feature"])
             .unwrap();
 
         // Delete the worktree
@@ -463,16 +403,48 @@ mod tests {
         assert!(recover_from_path(&deep_path).is_some());
     }
 
+    /// Regression test for #2462: deleted-CWD recovery must handle a
+    /// subdirectory path whose parents include a symlink. The shell may have
+    /// been entered through a symlinked parent (e.g. `~/link/repo.feature`)
+    /// and may have descended into a subdirectory before the worktree was
+    /// removed, so $PWD is `~/link/repo.feature/src` while the worktree git
+    /// recorded is `<canonical>/repo.feature`.
+    #[cfg(unix)]
+    #[test]
+    fn test_recover_from_path_symlinked_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let test = TestRepo::at(&base.join("repo"));
+        test.commit("init");
+
+        let wt_path = base.join("feature-wt");
+        let wt_str = wt_path.to_string_lossy();
+        test.repo
+            .run_command(&["worktree", "add", &wt_str, "-b", "feature"])
+            .unwrap();
+
+        // Symlink that points at `base`, so paths like `<base>/link/feature-wt`
+        // resolve to `<base>/feature-wt` but spell differently.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+
+        // Delete the worktree (simulating wt remove from another terminal)
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        // The shell's $PWD goes through the symlink and descends into the
+        // worktree. Recovery must still find the parent repo.
+        let deep_path = link.join("feature-wt").join("src").join("lib.rs");
+        assert!(
+            recover_from_path(&deep_path).is_some(),
+            "recovery should succeed for symlinked subdirectory of a removed worktree"
+        );
+    }
+
     #[test]
     fn test_hint_for_repo_suggests_switch() {
         // A normal repo with a main worktree should suggest `wt switch ^`.
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        let repo = Repository::at(tmp.path()).unwrap();
-        configure_test_identity(&repo);
-        repo.run_command(&["commit", "--allow-empty", "-m", "init"])
-            .unwrap();
-        let hint = hint_for_repo(&repo);
+        let test = TestRepo::with_initial_commit();
+        let hint = hint_for_repo(&test.repo);
         insta::assert_snapshot!(hint.ansi_strip(), @"Current directory was removed. Try: wt switch ^");
     }
 
@@ -480,14 +452,8 @@ mod tests {
     fn test_hint_for_repo_fallback_to_list() {
         // A bare repo with no worktrees has no default branch worktree,
         // so it should suggest `wt list` instead of `wt switch ^`.
-        let tmp = tempfile::tempdir().unwrap();
-        Cmd::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .current_dir(tmp.path())
-            .run()
-            .unwrap();
-        let repo = Repository::at(tmp.path()).unwrap();
-        let hint = hint_for_repo(&repo);
+        let test = TestRepo::bare();
+        let hint = hint_for_repo(&test.repo);
         insta::assert_snapshot!(hint.ansi_strip(), @"Current directory was removed. Run wt list to see worktrees");
     }
 }
